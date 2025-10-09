@@ -22,7 +22,7 @@ export OMP_PLACES=cores
 export OMP_PROC_BIND=true
 
 # Set the size of the matrix and the number of iterations
-export N=10000
+export N=1000
 export ITERS=1000
 
 # Run the program with the specified parameters

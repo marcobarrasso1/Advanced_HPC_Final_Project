@@ -1,4 +1,4 @@
 mpicc -fopenmp -O3 -march=native  -Wall  -o jacobi_cpu jacobi_cpu.c
 
-mpicc -O3 -march=native -Wall -Wextra -Wpedantic -Werror -lm -fast -Minfo=all -v -Mneginfo -gpu=cc80 -target=gpu -gpu=nomanaged -mp=multicore,gpu jacobi.c -o jacobi.x
+mpicc -O3 -march=native -Wall -Wextra -Wpedantic -Werror -lm -fast -Minfo=all -v -Mneginfo -gpu=cc80 -target=gpu -gpu=nomanaged -mp=multicore,gpu jacobi_gpu.c -o jacobi.x
 

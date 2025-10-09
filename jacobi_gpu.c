@@ -90,74 +90,95 @@ int main(int argc, char **argv) {
 
     // 6) Offload region with MPI RMA and GPU compute
     double communication_time = 0.0;
-    double compute_time       = 0.0;
+double compute_time       = 0.0;
 
-    #pragma omp target data map(tofrom: mat[0:total_size]) \
-                              map(tofrom: mat_new[0:total_size])
+/* Windows for my first/last interior rows.
+   Neighbors will GET from these into their ghost rows. */
+MPI_Win win_top   = MPI_WIN_NULL;  // exposes my row 1
+MPI_Win win_bottom= MPI_WIN_NULL;  // exposes my row local_rows
+
+/* Total elements already computed above: total_rows = local_rows + 2; total_cols = N + 2; */
+int total_size = total_rows * total_cols;
+
+#pragma omp target data map(tofrom: mat[0:total_size]) \
+                        map(tofrom: mat_new[0:total_size])
+{
+    /* Create the windows over HOST memory that neighbors will read from.
+       We enter a use_device_ptr region only to be consistent with your snippet,
+       but the base addresses we pass to MPI_Win_create are host pointers. */
+    #pragma omp target data use_device_ptr(mat)
     {
-        // Create RMA windows on device pointer
-        #pragma omp target data use_device_ptr(mat)
-        {
-            MPI_Win win_top, win_bot;
-            MPI_Win_create(mat + (1*total_cols),          total_cols*sizeof(double), sizeof(double), MPI_INFO_NULL, MPI_COMM_WORLD, &win_top);
-            MPI_Win_create(mat + (local_rows*total_cols), total_cols*sizeof(double), sizeof(double), MPI_INFO_NULL, MPI_COMM_WORLD, &win_bot);
-        }
-            for (int it = 0; it < iters; ++it) {
-                // a) Exchange ghost rows via RMA
+        MPI_Win_create(&mat[1 * total_cols],              /* row 1 (first interior) */
+                       total_cols * sizeof(double),
+                       sizeof(double), MPI_INFO_NULL, MPI_COMM_WORLD, &win_top);
 
-                #pragma omp barrier
-                MPI_Barrier(MPI_COMM_WORLD);
-
-                double t_comm = MPI_Wtime();
-
-                #pragma omp target data use_device_ptr(mat)
-                {
-                    MPI_Win_fence(0, win_top);
-                    MPI_Win_fence(0, win_bot);
-
-                    MPI_Get(mat + ((local_rows+1)*total_cols), total_cols, MPI_DOUBLE,
-                            below, 0, total_cols, MPI_DOUBLE, win_top);
-                    MPI_Get(mat, total_cols, MPI_DOUBLE,
-                            above, 0, total_cols, MPI_DOUBLE, win_bot);
-
-                    MPI_Win_fence(0, win_top);
-                    MPI_Win_fence(0, win_bot);
-                }
-
-                #pragma omp barrier
-                MPI_Barrier(MPI_COMM_WORLD);
-
-                communication_time += MPI_Wtime() - t_comm;
-
-                // b) GPU compute
-                double t_comp = MPI_Wtime();
-                #pragma omp target teams distribute parallel for simd collapse(2) num_teams(108)
-                for (int i = 1; i <= local_rows; ++i) {
-                    for (int j = 1; j <= N; ++j) {
-                        mat_new[i*total_cols + j] = 0.25 * (
-                            mat[(i-1)*total_cols + j] +
-                            mat[(i+1)*total_cols + j] +
-                            mat[i*total_cols + (j-1)] +
-                            mat[i*total_cols + (j+1)]
-                        );
-                    }
-                }
-
-                #pragma omp barrier
-                MPI_Barrier(MPI_COMM_WORLD);
-
-                compute_time += MPI_Wtime() - t_comp;
-
-                // swap on device
-                double *tmp = mat; mat = mat_new; mat_new = tmp;
-            }
-
-            // free windows
-            MPI_Win_free(&win_top);
-            MPI_Win_free(&win_bot);
-        }
+        MPI_Win_create(&mat[local_rows * total_cols],     /* last interior row */
+                       total_cols * sizeof(double),
+                       sizeof(double), MPI_INFO_NULL, MPI_COMM_WORLD, &win_bottom);
     }
 
+    for (int it = 0; it < iters; ++it)
+    {
+        /* Time the comms */
+        double t_comm = MPI_Wtime();
+
+        /* Make sure the two interior rows we expose are current on the HOST
+           (we update FROM device only those two rows). */
+        #pragma omp target update from( mat[1 * total_cols            : total_cols] )
+        #pragma omp target update from( mat[local_rows * total_cols   : total_cols] )
+
+        /* Start access epochs on both windows, do the GETs, then complete epochs. */
+        // (All ranks in the communicator must call fence in the same order.)
+        MPI_Win_fence(0, win_top);
+        MPI_Win_fence(0, win_bottom);
+
+        /* Get neighbor interior rows into my ghost rows */
+        if (below != MPI_PROC_NULL) {
+            /* From my 'below' neighbor's win_top (their row 1) into my bottom ghost row */
+            MPI_Get(&mat[(local_rows + 1) * total_cols], total_cols, MPI_DOUBLE,
+                    below, /*disp=*/0, total_cols, MPI_DOUBLE, win_top);
+        }
+        if (above != MPI_PROC_NULL) {
+            /* From my 'above' neighbor's win_bottom (their last interior row) into my top ghost row */
+            MPI_Get(&mat[0 * total_cols], total_cols, MPI_DOUBLE,
+                    above, /*disp=*/0, total_cols, MPI_DOUBLE, win_bottom);
+        }
+
+        MPI_Win_fence(0, win_top);
+        MPI_Win_fence(0, win_bottom);
+
+        /* Push the two received ghost rows back to the device */
+        #pragma omp target update to( mat[0 * total_cols                : total_cols] )
+        #pragma omp target update to( mat[(local_rows + 1) * total_cols : total_cols] )
+
+        communication_time += MPI_Wtime() - t_comm;
+
+        /* Compute on GPU (interior only) */
+        double t_comp = MPI_Wtime();
+
+        #pragma omp target teams distribute parallel for collapse(2)
+        for (int i = 1; i <= local_rows; ++i) {
+            for (int j = 1; j <= N; ++j) {
+                mat_new[i*total_cols + j] = 0.25 * (
+                    mat[(i-1)*total_cols + j] +
+                    mat[(i+1)*total_cols + j] +
+                    mat[i*total_cols + (j-1)] +
+                    mat[i*total_cols + (j+1)]
+                );
+            }
+        }
+
+        compute_time += MPI_Wtime() - t_comp;
+
+        /* Swap (both arrays remain mapped) */
+        double *tmp = mat; mat = mat_new; mat_new = tmp;
+    }
+
+} /* end target data */
+
+/* Free windows after leaving the mapped region */
+MPI_Win_free(&win_top);
+MPI_Win_free(&win_bottom);
     // 7) Print timings on rank 0
     if (rank == 0) {
         printf("Initialization time: %f s\n", init_time);
