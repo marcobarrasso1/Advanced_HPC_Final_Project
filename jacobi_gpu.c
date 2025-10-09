@@ -97,8 +97,6 @@ double compute_time       = 0.0;
 MPI_Win win_top   = MPI_WIN_NULL;  // exposes my row 1
 MPI_Win win_bottom= MPI_WIN_NULL;  // exposes my row local_rows
 
-/* Total elements already computed above: total_rows = local_rows + 2; total_cols = N + 2; */
-int total_size = total_rows * total_cols;
 
 #pragma omp target data map(tofrom: mat[0:total_size]) \
                         map(tofrom: mat_new[0:total_size])
